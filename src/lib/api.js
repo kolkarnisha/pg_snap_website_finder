@@ -1,9 +1,173 @@
-import { supabase } from './supabase';
+import { supabase, isSupabaseConfigured } from './supabase';
+import { auth, db, isFirebaseConfigured } from './firebase';
+import { 
+  createUserWithEmailAndPassword, 
+  signInWithEmailAndPassword, 
+  signInWithPopup, 
+  GoogleAuthProvider, 
+  FacebookAuthProvider, 
+  signOut as firebaseSignOut,
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  doc, 
+  setDoc, 
+  getDoc, 
+  getDocs, 
+  updateDoc, 
+  collection, 
+  query, 
+  where 
+} from 'firebase/firestore';
+import { pgData } from '../data/pgData';
+
+// ─── LOCAL STORAGE MOCK SETUP ──────────────────────────────────────────────────
+const MOCK_USERS_KEY = 'pg_mock_users';
+const MOCK_LISTINGS_KEY = 'pg_mock_listings';
+const MOCK_BOOKINGS_KEY = 'pg_mock_bookings';
+const CURRENT_USER_KEY = 'pg_current_user';
+const SESSION_KEY = 'pg_session';
+
+function getStorageItem(key, defaultValue) {
+  try {
+    const item = localStorage.getItem(key);
+    return item ? JSON.parse(item) : defaultValue;
+  } catch {
+    return defaultValue;
+  }
+}
+
+function setStorageItem(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    console.error(`Error setting localStorage key "${key}":`, err);
+  }
+}
+
+// Initialize mock datasets (only if neither backend is configured)
+if (!isSupabaseConfigured && !isFirebaseConfigured) {
+  if (!localStorage.getItem(MOCK_LISTINGS_KEY)) {
+    setStorageItem(MOCK_LISTINGS_KEY, pgData);
+  }
+
+  const defaultUsers = [
+    {
+      id: 'mock-user-1',
+      email: 'test@example.com',
+      password: 'password',
+      user_metadata: { name: 'Test Tenant', role: 'tenant' },
+      app_metadata: { provider: 'email' }
+    },
+    {
+      id: 'mock-user-2',
+      email: 'owner@example.com',
+      password: 'password',
+      user_metadata: { name: 'Test Owner', role: 'owner' },
+      app_metadata: { provider: 'email' }
+    }
+  ];
+
+  if (!localStorage.getItem(MOCK_USERS_KEY)) {
+    setStorageItem(MOCK_USERS_KEY, defaultUsers);
+  }
+}
+
+// Mock auth callbacks subscription registry
+const authListeners = new Set();
+
+function notifyAuthListeners(event, session) {
+  authListeners.forEach(cb => {
+    try {
+      cb(event, session);
+    } catch (err) {
+      console.error('Error in mock auth callback:', err);
+    }
+  });
+}
+
+// ─── USER LOGIN RECORDER ──────────────────────────────────────────────────────
+
+/**
+ * Insert a row into user_logins table to track login activity.
+ * Called after every successful sign-up or sign-in.
+ */
+async function recordUserLogin({ userId, name, email, role, provider }) {
+  if (!isSupabaseConfigured) return;
+  try {
+    await supabase.from('user_logins').insert([{
+      user_id:  userId,
+      name:     name || null,
+      email:    email,
+      role:     role || 'tenant',
+      provider: provider || 'email',
+      login_at: new Date().toISOString(),
+    }]);
+  } catch (err) {
+    // Non-fatal – just log
+    console.warn('Could not record login event:', err.message);
+  }
+}
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 
 /** Sign up with email and password */
 export async function signUp({ email, password, name, role }) {
+  if (isFirebaseConfigured) {
+    const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+    const user = userCredential.user;
+    
+    // Save profile to profiles collection
+    await setDoc(doc(db, 'profiles', user.uid), {
+      id: user.uid,
+      name,
+      email,
+      role
+    });
+
+    const sessionUser = {
+      id: user.uid,
+      email: user.email,
+      user_metadata: { name, role },
+      app_metadata: { provider: 'email' }
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'firebase-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
+  if (!isSupabaseConfigured) {
+    const users = getStorageItem(MOCK_USERS_KEY, []);
+    if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+      throw new Error('An account with this email already exists.');
+    }
+    const newUser = {
+      id: 'mock-user-' + Math.random().toString(36).substr(2, 9),
+      email,
+      password,
+      user_metadata: { name, role },
+      app_metadata: { provider: 'email' }
+    };
+    users.push(newUser);
+    setStorageItem(MOCK_USERS_KEY, users);
+
+    const sessionUser = {
+      id: newUser.id,
+      email: newUser.email,
+      user_metadata: newUser.user_metadata,
+      app_metadata: newUser.app_metadata
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'mock-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
@@ -21,19 +185,151 @@ export async function signUp({ email, password, name, role }) {
       email,
       role,
     });
+
+    // Record signup in user_logins
+    await recordUserLogin({
+      userId:   data.user.id,
+      name,
+      email,
+      role,
+      provider: 'email',
+    });
   }
   return data;
 }
 
 /** Sign in with email and password */
 export async function signIn({ email, password }) {
+  if (isFirebaseConfigured) {
+    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    const user = userCredential.user;
+
+    // Fetch profile
+    let role = 'tenant';
+    let name = user.displayName || user.email.split('@')[0];
+    try {
+      const profileDoc = await getDoc(doc(db, 'profiles', user.uid));
+      if (profileDoc.exists()) {
+        role = profileDoc.data().role || 'tenant';
+        name = profileDoc.data().name || name;
+      }
+    } catch (err) {
+      console.error('Error fetching profile on signin:', err);
+    }
+
+    const sessionUser = {
+      id: user.uid,
+      email: user.email,
+      user_metadata: { name, role },
+      app_metadata: { provider: 'email' }
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'firebase-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
+  if (!isSupabaseConfigured) {
+    const users = getStorageItem(MOCK_USERS_KEY, []);
+    const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
+    if (!user || user.password !== password) {
+      throw new Error('Invalid login credentials. Use test@example.com / password.');
+    }
+
+    const sessionUser = {
+      id: user.id,
+      email: user.email,
+      user_metadata: user.user_metadata,
+      app_metadata: user.app_metadata
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'mock-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
   if (error) throw error;
+
+  // Record login in user_logins
+  if (data.user) {
+    await recordUserLogin({
+      userId:   data.user.id,
+      name:     data.user.user_metadata?.name || email.split('@')[0],
+      email,
+      role:     data.user.user_metadata?.role || 'tenant',
+      provider: 'email',
+    });
+  }
   return data;
 }
 
 /** Sign in with Google OAuth */
 export async function signInWithGoogle() {
+  if (isFirebaseConfigured) {
+    const provider = new GoogleAuthProvider();
+    // Always show the account chooser so the user can pick any Google account
+    provider.setCustomParameters({ prompt: 'select_account' });
+    // Request email and profile access
+    provider.addScope('email');
+    provider.addScope('profile');
+    const userCredential = await signInWithPopup(auth, provider);
+    const user = userCredential.user;
+
+    // Fetch or create profile
+    let role = 'tenant';
+    let name = user.displayName || user.email.split('@')[0];
+    try {
+      const profileRef = doc(db, 'profiles', user.uid);
+      const profileDoc = await getDoc(profileRef);
+      if (profileDoc.exists()) {
+        role = profileDoc.data().role || 'tenant';
+        name = profileDoc.data().name || name;
+      } else {
+        await setDoc(profileRef, {
+          id: user.uid,
+          email: user.email,
+          name,
+          role
+        });
+      }
+    } catch (err) {
+      console.error('Error getting/setting profile for Google auth:', err);
+    }
+
+    const sessionUser = {
+      id: user.uid,
+      email: user.email,
+      user_metadata: { name, role },
+      app_metadata: { provider: 'google' }
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'firebase-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
+  if (!isSupabaseConfigured) {
+    const sessionUser = {
+      id: 'mock-google-user',
+      email: 'google.user@example.com',
+      user_metadata: { name: 'Google User', role: 'tenant' },
+      app_metadata: { provider: 'google' }
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'mock-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
   const { data, error } = await supabase.auth.signInWithOAuth({
     provider: 'google',
     options: {
@@ -41,30 +337,237 @@ export async function signInWithGoogle() {
     },
   });
   if (error) throw error;
+  // Note: For OAuth redirects, login recording happens in onAuthChange listener
+  return data;
+}
+
+/** Sign in with Facebook OAuth */
+export async function signInWithFacebook() {
+  if (isFirebaseConfigured) {
+    const provider = new FacebookAuthProvider();
+    const userCredential = await signInWithPopup(auth, provider);
+    const user = userCredential.user;
+
+    // Fetch or create profile
+    let role = 'tenant';
+    let name = user.displayName || user.email?.split('@')[0] || 'Facebook User';
+    try {
+      const profileRef = doc(db, 'profiles', user.uid);
+      const profileDoc = await getDoc(profileRef);
+      if (profileDoc.exists()) {
+        role = profileDoc.data().role || 'tenant';
+        name = profileDoc.data().name || name;
+      } else {
+        await setDoc(profileRef, {
+          id: user.uid,
+          email: user.email || '',
+          name,
+          role
+        });
+      }
+    } catch (err) {
+      console.error('Error getting/setting profile for Facebook auth:', err);
+    }
+
+    const sessionUser = {
+      id: user.uid,
+      email: user.email,
+      user_metadata: { name, role },
+      app_metadata: { provider: 'facebook' }
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'firebase-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
+  if (!isSupabaseConfigured) {
+    const sessionUser = {
+      id: 'mock-facebook-user',
+      email: 'facebook.user@example.com',
+      user_metadata: { name: 'Facebook User', role: 'tenant' },
+      app_metadata: { provider: 'facebook' }
+    };
+    setStorageItem(CURRENT_USER_KEY, sessionUser);
+    setStorageItem(SESSION_KEY, 'mock-session-token');
+
+    notifyAuthListeners('SIGNED_IN', { user: sessionUser });
+
+    return { user: sessionUser };
+  }
+
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: 'facebook',
+    options: {
+      redirectTo: window.location.origin,
+    },
+  });
+  if (error) throw error;
+  // Note: For OAuth redirects, login recording happens in onAuthChange listener
   return data;
 }
 
 /** Sign out */
 export async function signOut() {
+  if (isFirebaseConfigured) {
+    await firebaseSignOut(auth);
+    localStorage.removeItem(CURRENT_USER_KEY);
+    localStorage.removeItem(SESSION_KEY);
+    notifyAuthListeners('SIGNED_OUT', null);
+    return;
+  }
+
+  if (!isSupabaseConfigured) {
+    localStorage.removeItem(CURRENT_USER_KEY);
+    localStorage.removeItem(SESSION_KEY);
+    notifyAuthListeners('SIGNED_OUT', null);
+    return;
+  }
+
   const { error } = await supabase.auth.signOut();
   if (error) throw error;
 }
 
 /** Get current user */
 export async function getCurrentUser() {
+  if (isFirebaseConfigured) {
+    const firebaseUser = auth.currentUser;
+    if (!firebaseUser) return null;
+    
+    // Fetch profile
+    let role = 'tenant';
+    let name = firebaseUser.displayName || firebaseUser.email.split('@')[0];
+    try {
+      const profileDoc = await getDoc(doc(db, 'profiles', firebaseUser.uid));
+      if (profileDoc.exists()) {
+        role = profileDoc.data().role || 'tenant';
+        name = profileDoc.data().name || name;
+      }
+    } catch (err) {
+      console.error(err);
+    }
+
+    return {
+      id: firebaseUser.uid,
+      email: firebaseUser.email,
+      user_metadata: { name, role },
+      app_metadata: { provider: firebaseUser.providerData?.[0]?.providerId || 'email' }
+    };
+  }
+
+  if (!isSupabaseConfigured) {
+    return getStorageItem(CURRENT_USER_KEY, null);
+  }
+
   const { data: { user } } = await supabase.auth.getUser();
   return user;
 }
 
 /** Get current session */
 export async function getSession() {
+  if (isFirebaseConfigured) {
+    const user = await getCurrentUser();
+    return user ? { user } : null;
+  }
+
+  if (!isSupabaseConfigured) {
+    const user = getStorageItem(CURRENT_USER_KEY, null);
+    return user ? { user } : null;
+  }
+
   const { data: { session } } = await supabase.auth.getSession();
   return session;
 }
 
 /** Listen to auth changes */
 export function onAuthChange(callback) {
-  return supabase.auth.onAuthStateChange((event, session) => {
+  if (isFirebaseConfigured) {
+    const internalCb = (event, session) => callback(event, session);
+    authListeners.add(internalCb);
+
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        let role = 'tenant';
+        let name = user.displayName || user.email.split('@')[0];
+        try {
+          const profileDoc = await getDoc(doc(db, 'profiles', user.uid));
+          if (profileDoc.exists()) {
+            role = profileDoc.data().role || 'tenant';
+            name = profileDoc.data().name || name;
+          }
+        } catch (err) {
+          console.error(err);
+        }
+        const sessionUser = {
+          id: user.uid,
+          email: user.email,
+          user_metadata: { name, role },
+          app_metadata: { provider: user.providerData?.[0]?.providerId || 'email' }
+        };
+        setStorageItem(CURRENT_USER_KEY, sessionUser);
+        setStorageItem(SESSION_KEY, 'firebase-session-token');
+        callback('SIGNED_IN', { user: sessionUser });
+      } else {
+        localStorage.removeItem(CURRENT_USER_KEY);
+        localStorage.removeItem(SESSION_KEY);
+        callback('SIGNED_OUT', null);
+      }
+    });
+
+    return {
+      data: {
+        subscription: {
+          unsubscribe: () => {
+            authListeners.delete(internalCb);
+            unsubscribe();
+          }
+        }
+      }
+    };
+  }
+
+  if (!isSupabaseConfigured) {
+    authListeners.add(callback);
+
+    // Async trigger to match supabase callback dispatch behavior
+    setTimeout(() => {
+      const user = getStorageItem(CURRENT_USER_KEY, null);
+      if (user) {
+        callback('SIGNED_IN', { user });
+      } else {
+        callback('SIGNED_OUT', null);
+      }
+    }, 50);
+
+    return {
+      data: {
+        subscription: {
+          unsubscribe: () => {
+            authListeners.delete(callback);
+          }
+        }
+      }
+    };
+  }
+
+  return supabase.auth.onAuthStateChange(async (event, session) => {
+    // Record OAuth logins (Google/Facebook) when user lands back after redirect
+    if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') && session?.user) {
+      const u = session.user;
+      const provider = u.app_metadata?.provider || 'email';
+      if (provider !== 'email') {
+        // OAuth providers — record the login event
+        await recordUserLogin({
+          userId:   u.id,
+          name:     u.user_metadata?.full_name || u.user_metadata?.name || u.email?.split('@')[0],
+          email:    u.email,
+          role:     u.user_metadata?.role || 'tenant',
+          provider,
+        });
+      }
+    }
     callback(event, session);
   });
 }
@@ -72,6 +575,25 @@ export function onAuthChange(callback) {
 // ─── PROFILES ─────────────────────────────────────────────────────────────────
 
 export async function getProfile(userId) {
+  if (isFirebaseConfigured) {
+    const docRef = doc(db, 'profiles', userId);
+    const docSnap = await getDoc(docRef);
+    if (!docSnap.exists()) throw new Error('Profile not found');
+    return docSnap.data();
+  }
+
+  if (!isSupabaseConfigured) {
+    const users = getStorageItem(MOCK_USERS_KEY, []);
+    const user = users.find(u => u.id === userId);
+    if (!user) throw new Error('Profile not found');
+    return {
+      id: user.id,
+      name: user.user_metadata?.name || 'Mock User',
+      email: user.email,
+      role: user.user_metadata?.role || 'tenant'
+    };
+  }
+
   const { data, error } = await supabase
     .from('profiles')
     .select('*')
@@ -85,6 +607,31 @@ export async function getProfile(userId) {
 
 /** Fetch all PG listings */
 export async function getPGListings() {
+  if (isFirebaseConfigured) {
+    const colRef = collection(db, 'pg_listings');
+    const querySnapshot = await getDocs(colRef);
+    if (querySnapshot.empty) {
+      console.log('Seeding Firestore with default PG listings...');
+      for (const pg of pgData) {
+        const docData = { ...pg };
+        if (docData.reviews) delete docData.reviews;
+        await setDoc(doc(db, 'pg_listings', String(pg.id)), docData);
+        if (pg.reviews && pg.reviews.length > 0) {
+          for (const rev of pg.reviews) {
+            await setDoc(doc(collection(db, 'pg_listings', String(pg.id), 'reviews'), rev.id || 'r-' + Math.random().toString(36).substr(2, 9)), rev);
+          }
+        }
+      }
+      const newSnapshot = await getDocs(colRef);
+      return newSnapshot.docs.map(doc => doc.data());
+    }
+    return querySnapshot.docs.map(doc => doc.data());
+  }
+
+  if (!isSupabaseConfigured) {
+    return getStorageItem(MOCK_LISTINGS_KEY, pgData);
+  }
+
   const { data, error } = await supabase
     .from('pg_listings')
     .select('*')
@@ -95,6 +642,32 @@ export async function getPGListings() {
 
 /** Fetch single PG by ID */
 export async function getPGById(id) {
+  if (isFirebaseConfigured) {
+    const docRef = doc(db, 'pg_listings', String(id));
+    const docSnap = await getDoc(docRef);
+    if (!docSnap.exists()) throw new Error('PG listing not found');
+    const pg = docSnap.data();
+    
+    // Fetch reviews
+    const reviewsSnap = await getDocs(collection(db, 'pg_listings', String(id), 'reviews'));
+    const reviews = reviewsSnap.docs.map(d => d.data());
+    return {
+      ...pg,
+      pg_reviews: reviews
+    };
+  }
+
+  if (!isSupabaseConfigured) {
+    const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+    const pg = listings.find(item => item.id === Number(id));
+    if (!pg) throw new Error('PG listing not found');
+
+    return {
+      ...pg,
+      pg_reviews: pg.reviews || []
+    };
+  }
+
   const { data, error } = await supabase
     .from('pg_listings')
     .select('*, pg_reviews(*)')
@@ -105,10 +678,45 @@ export async function getPGById(id) {
 }
 
 /** Create a new PG listing */
-export async function createPGListing(pgData) {
+export async function createPGListing(pgListingData) {
+  if (isFirebaseConfigured) {
+    const listings = await getPGListings();
+    const newId = listings.length > 0 ? Math.max(...listings.map(l => Number(l.id) || 0)) + 1 : 1;
+    const pg = {
+      ...pgListingData,
+      id: newId,
+      rating: 5.0,
+      distance: pgListingData.distance || '1.0 km',
+      totalFloors: pgListingData.total_floors || 3,
+      floorAvailability: pgListingData.floor_availability || { "1": 1, "2": 1, "3": 1 },
+      amenities: pgListingData.amenities || [],
+      created_at: new Date().toISOString()
+    };
+    await setDoc(doc(db, 'pg_listings', String(newId)), pg);
+    return pg;
+  }
+
+  if (!isSupabaseConfigured) {
+    const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+    const newId = listings.length > 0 ? Math.max(...listings.map(l => l.id)) + 1 : 1;
+    const pg = {
+      ...pgListingData,
+      id: newId,
+      rating: 5.0,
+      distance: pgListingData.distance || '1.0 km',
+      reviews: [],
+      totalFloors: pgListingData.total_floors || 3,
+      floorAvailability: pgListingData.floor_availability || { "1": 1, "2": 1, "3": 1 },
+      amenities: pgListingData.amenities || []
+    };
+    listings.unshift(pg);
+    setStorageItem(MOCK_LISTINGS_KEY, listings);
+    return pg;
+  }
+
   const { data, error } = await supabase
     .from('pg_listings')
-    .insert([pgData])
+    .insert([pgListingData])
     .select()
     .single();
   if (error) throw error;
@@ -119,6 +727,29 @@ export async function createPGListing(pgData) {
 
 /** Create a new booking */
 export async function createBooking(bookingData) {
+  if (isFirebaseConfigured) {
+    const bookingRef = doc(collection(db, 'bookings'));
+    const newBooking = {
+      ...bookingData,
+      id: bookingRef.id,
+      created_at: new Date().toISOString()
+    };
+    await setDoc(bookingRef, newBooking);
+    return newBooking;
+  }
+
+  if (!isSupabaseConfigured) {
+    const bookings = getStorageItem(MOCK_BOOKINGS_KEY, []);
+    const newBooking = {
+      ...bookingData,
+      id: 'mock-booking-' + Math.random().toString(36).substr(2, 9),
+      created_at: new Date().toISOString()
+    };
+    bookings.push(newBooking);
+    setStorageItem(MOCK_BOOKINGS_KEY, bookings);
+    return newBooking;
+  }
+
   const { data, error } = await supabase
     .from('bookings')
     .insert([bookingData])
@@ -130,6 +761,42 @@ export async function createBooking(bookingData) {
 
 /** Get bookings for current user */
 export async function getUserBookings(userId) {
+  if (isFirebaseConfigured) {
+    const q = query(collection(db, 'bookings'), where('user_id', '==', userId));
+    const querySnapshot = await getDocs(q);
+    const bookings = querySnapshot.docs.map(doc => doc.data());
+    
+    const resolvedBookings = [];
+    for (const b of bookings) {
+      let pg_listings = null;
+      try {
+        const pgRef = doc(db, 'pg_listings', String(b.pg_id));
+        const pgSnap = await getDoc(pgRef);
+        if (pgSnap.exists()) {
+          pg_listings = pgSnap.data();
+        }
+      } catch (e) {
+        console.error('Error fetching booking listing:', e);
+      }
+      resolvedBookings.push({
+        ...b,
+        pg_listings
+      });
+    }
+    return resolvedBookings;
+  }
+
+  if (!isSupabaseConfigured) {
+    const bookings = getStorageItem(MOCK_BOOKINGS_KEY, []);
+    const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+
+    const userBookings = bookings.filter(b => b.user_id === userId);
+    return userBookings.map(b => ({
+      ...b,
+      pg_listings: listings.find(l => l.id === b.pg_id) || null
+    }));
+  }
+
   const { data, error } = await supabase
     .from('bookings')
     .select('*, pg_listings(*)')
@@ -143,6 +810,60 @@ export async function getUserBookings(userId) {
 
 /** Add a review */
 export async function addReview({ pgId, userId, rating, text, author }) {
+  if (isFirebaseConfigured) {
+    const reviewsCol = collection(db, 'pg_listings', String(pgId), 'reviews');
+    const reviewRef = doc(reviewsCol);
+    const newReview = {
+      id: reviewRef.id,
+      author,
+      rating: Number(rating),
+      text,
+      date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) || 'Just now',
+      avatar: author ? author.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2) : 'U',
+      created_at: new Date().toISOString()
+    };
+    await setDoc(reviewRef, newReview);
+
+    // Recalculate average rating
+    const allReviewsSnap = await getDocs(reviewsCol);
+    const allReviews = allReviewsSnap.docs.map(d => d.data());
+    const totalRating = allReviews.reduce((sum, r) => sum + r.rating, 0);
+    const newRating = Number((totalRating / allReviews.length).toFixed(1));
+
+    const pgRef = doc(db, 'pg_listings', String(pgId));
+    await updateDoc(pgRef, { rating: newRating });
+
+    return newReview;
+  }
+
+  if (!isSupabaseConfigured) {
+    const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+    const pgIndex = listings.findIndex(l => l.id === Number(pgId));
+    if (pgIndex === -1) throw new Error('PG listing not found');
+
+    const pg = listings[pgIndex];
+    if (!pg.reviews) pg.reviews = [];
+
+    const newReview = {
+      id: 'mock-review-' + Math.random().toString(36).substr(2, 9),
+      author,
+      rating: Number(rating),
+      text,
+      date: 'Just now',
+      avatar: author ? author.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2) : 'U'
+    };
+
+    pg.reviews.unshift(newReview);
+
+    const totalRating = pg.reviews.reduce((sum, r) => sum + r.rating, 0);
+    pg.rating = Number((totalRating / pg.reviews.length).toFixed(1));
+
+    listings[pgIndex] = pg;
+    setStorageItem(MOCK_LISTINGS_KEY, listings);
+
+    return newReview;
+  }
+
   const { data, error } = await supabase
     .from('pg_reviews')
     .insert([{ pg_id: pgId, user_id: userId, rating, text, author }])
@@ -151,3 +872,316 @@ export async function addReview({ pgId, userId, rating, text, author }) {
   if (error) throw error;
   return data;
 }
+
+// ─── OWNER DASHBOARD & AUTHENTICATION ──────────────────────────────────────────
+
+const BACKEND_URL = 'http://localhost:8000';
+
+function getOwnerHeaders() {
+  const token = localStorage.getItem('owner_token');
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+  };
+}
+
+// Initialize mock owners in local storage if not already there
+function initMockOwners() {
+  const mockOwners = localStorage.getItem('pg_mock_owners');
+  if (!mockOwners) {
+    // We store simple plaintext password for mock testing, or mock hashed
+    localStorage.setItem('pg_mock_owners', JSON.stringify([
+      { pg_name: 'Comfort Zone PG', password: 'password123', owner_name: 'John Doe', email: 'comfortzone@example.com', phone_number: '9876543210' },
+      { pg_name: 'Green Valley PG', password: 'password123', owner_name: 'Jane Smith', email: 'greenvalley@example.com', phone_number: '9876543211' }
+    ]));
+  }
+}
+
+/** Authenticate owner (dual-mode: FastAPI with localStorage mock fallback) */
+export async function loginOwner({ pgName, password }) {
+  initMockOwners();
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/owner/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pg_name: pgName, password })
+    });
+    
+    if (!response.ok) {
+      const errData = await response.json();
+      throw new Error(errData.detail || 'Login failed.');
+    }
+    
+    const data = await response.json();
+    localStorage.setItem('owner_token', data.token);
+    localStorage.setItem('owner_pg_name', data.pg_name);
+    localStorage.setItem('owner_profile', JSON.stringify(data));
+    return data;
+  } catch (err) {
+    // If backend is down, use local storage fallback
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError')) {
+      console.warn('⚠️ FastAPI backend not running. Falling back to local storage mock for Owner Login.');
+      const owners = JSON.parse(localStorage.getItem('pg_mock_owners'));
+      const matched = owners.find(o => o.pg_name.toLowerCase() === pgName.toLowerCase());
+      
+      if (!matched) {
+        throw new Error('PG not found.');
+      }
+      if (matched.password !== password) {
+        throw new Error('Invalid PG Name or Password.');
+      }
+      
+      const mockResult = {
+        token: 'mock-jwt-owner-token',
+        pg_name: matched.pg_name,
+        owner_name: matched.owner_name,
+        email: matched.email,
+        isOfflineMock: true
+      };
+      
+      localStorage.setItem('owner_token', mockResult.token);
+      localStorage.setItem('owner_pg_name', mockResult.pg_name);
+      localStorage.setItem('owner_profile', JSON.stringify(mockResult));
+      return mockResult;
+    }
+    throw err;
+  }
+}
+
+/** Fetch Owner dashboard data (PG, Rooms, Bookings) */
+export async function getOwnerDashboardData() {
+  const pgName = localStorage.getItem('owner_pg_name');
+  if (!pgName) throw new Error('No owner session found.');
+  
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/owner/dashboard`, {
+      headers: getOwnerHeaders()
+    });
+    if (!response.ok) throw new Error('Failed to load dashboard data from backend.');
+    return await response.json();
+  } catch (err) {
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || localStorage.getItem('owner_token') === 'mock-jwt-owner-token') {
+      console.warn('⚠️ Offline fallback: Fetching dashboard data from mock database');
+      
+      // Get PG details
+      const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+      let pg = listings.find(l => l.name.toLowerCase() === pgName.toLowerCase());
+      
+      if (!pg) {
+        // Create mock PG listing
+        pg = {
+          id: Math.floor(Math.random() * 1000) + 10,
+          name: pgName,
+          location: 'Marathahalli',
+          gender: 'Co-Live',
+          rent: 9500,
+          rating: 4.8,
+          distance: '0.4 km',
+          amenities: ['WiFi', 'Food', 'Laundry', 'CCTV', 'Lift'],
+          total_floors: 4,
+          image: 'https://images.unsplash.com/photo-1522771739844-6a9f6d5f14af?w=600&q=80'
+        };
+        listings.push(pg);
+        setStorageItem(MOCK_LISTINGS_KEY, listings);
+      }
+      
+      // Get or Generate Rooms
+      let roomsByPG = getStorageItem('roomsByPG', {});
+      if (!roomsByPG[pg.id]) {
+        // import modules on the fly or duplicate generateRooms logic
+        const sharingTypes = ['single', 'double', 'triple', 'four'];
+        const prices = { single: 10000, double: 8000, triple: 6500, four: 5000 };
+        const mockRooms = [];
+        for (let floor = 1; floor <= (pg.total_floors || 4); floor++) {
+          for (let rNum = 1; rNum <= 4; rNum++) {
+            const roomNumber = floor * 100 + rNum;
+            const sharing = sharingTypes[(rNum - 1) % sharingTypes.length];
+            const rent = pg.rent;
+            const seed = (roomNumber * 7 + floor * 3) % 10;
+            const status = seed < 5 ? 'available' : (seed < 8 ? 'booked' : 'maintenance');
+            
+            mockRooms.push({
+              room_number: roomNumber,
+              roomNumber: roomNumber,
+              floor,
+              sharing,
+              rent: sharing === 'double' ? rent : prices[sharing],
+              status,
+              has_attached_bathroom: rNum <= 2,
+              is_ac: rNum === 1 || rNum === 4,
+              has_balcony: rNum === 4
+            });
+          }
+        }
+        roomsByPG[pg.id] = mockRooms;
+        setStorageItem('roomsByPG', roomsByPG);
+      }
+      
+      // Get Bookings
+      const bookings = getStorageItem('pgBookings', []);
+      const pgBookings = bookings.filter(b => b.pgId === pg.id || b.pg_id === pg.id);
+      
+      return {
+        pg,
+        rooms: roomsByPG[pg.id],
+        bookings: pgBookings,
+        isOfflineMock: true
+      };
+    }
+    throw err;
+  }
+}
+
+/** Update PG Details */
+export async function updateOwnerPG(updatedFields) {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/owner/pg`, {
+      method: 'PUT',
+      headers: getOwnerHeaders(),
+      body: JSON.stringify(updatedFields)
+    });
+    if (!response.ok) throw new Error('Failed to update PG details.');
+    return await response.json();
+  } catch (err) {
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || localStorage.getItem('owner_token') === 'mock-jwt-owner-token') {
+      const pgName = localStorage.getItem('owner_pg_name');
+      const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+      const idx = listings.findIndex(l => l.name.toLowerCase() === pgName.toLowerCase());
+      if (idx === -1) throw new Error('PG not found.');
+      
+      listings[idx] = { ...listings[idx], ...updatedFields };
+      setStorageItem(MOCK_LISTINGS_KEY, listings);
+      return { message: 'Updated offline', data: listings[idx] };
+    }
+    throw err;
+  }
+}
+
+/** Manage Owner Rooms CRUD */
+export async function manageOwnerRoom(action, roomData) {
+  const pgName = localStorage.getItem('owner_pg_name');
+  
+  try {
+    let response;
+    if (action === 'add') {
+      response = await fetch(`${BACKEND_URL}/api/owner/rooms`, {
+        method: 'POST',
+        headers: getOwnerHeaders(),
+        body: JSON.stringify(roomData)
+      });
+    } else if (action === 'edit') {
+      response = await fetch(`${BACKEND_URL}/api/owner/rooms/${roomData.room_number}`, {
+        method: 'PUT',
+        headers: getOwnerHeaders(),
+        body: JSON.stringify(roomData)
+      });
+    } else if (action === 'delete') {
+      response = await fetch(`${BACKEND_URL}/api/owner/rooms/${roomData.room_number}`, {
+        method: 'DELETE',
+        headers: getOwnerHeaders()
+      });
+    }
+    
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.detail || `Failed to ${action} room.`);
+    }
+    return await response.json();
+  } catch (err) {
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || localStorage.getItem('owner_token') === 'mock-jwt-owner-token') {
+      const listings = getStorageItem(MOCK_LISTINGS_KEY, pgData);
+      const pg = listings.find(l => l.name.toLowerCase() === pgName.toLowerCase());
+      if (!pg) throw new Error('PG not found.');
+      
+      let roomsByPG = getStorageItem('roomsByPG', {});
+      let rooms = roomsByPG[pg.id] || [];
+      
+      if (action === 'add') {
+        if (rooms.some(r => r.room_number === roomData.room_number)) {
+          throw new Error(`Room ${roomData.room_number} already exists.`);
+        }
+        const newRoom = {
+          ...roomData,
+          roomNumber: roomData.room_number,
+        };
+        rooms.push(newRoom);
+      } else if (action === 'edit') {
+        rooms = rooms.map(r => r.room_number === roomData.room_number ? { ...r, ...roomData, roomNumber: roomData.room_number } : r);
+      } else if (action === 'delete') {
+        rooms = rooms.filter(r => r.room_number !== roomData.room_number);
+      }
+      
+      roomsByPG[pg.id] = rooms;
+      setStorageItem('roomsByPG', roomsByPG);
+      return { message: `${action} complete` };
+    }
+    throw err;
+  }
+}
+
+/** Update booking status */
+export async function updateBookingStatus(bookingId, status) {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/owner/bookings/${bookingId}/status`, {
+      method: 'PUT',
+      headers: getOwnerHeaders(),
+      body: JSON.stringify({ status })
+    });
+    if (!response.ok) throw new Error('Failed to update booking status.');
+    return await response.json();
+  } catch (err) {
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || localStorage.getItem('owner_token') === 'mock-jwt-owner-token') {
+      const bookings = getStorageItem('pgBookings', []);
+      const idx = bookings.findIndex(b => String(b.id || b.bookingId) === String(bookingId));
+      if (idx === -1) throw new Error('Booking not found.');
+      
+      bookings[idx].status = status;
+      setStorageItem('pgBookings', bookings);
+      
+      // Auto book room if confirmed
+      if (status === 'confirmed' && bookings[idx].roomNumber) {
+        const roomsByPG = getStorageItem('roomsByPG', {});
+        const pgId = bookings[idx].pgId || bookings[idx].pg_id;
+        if (pgId && roomsByPG[pgId]) {
+          roomsByPG[pgId] = roomsByPG[pgId].map(r => r.room_number === bookings[idx].roomNumber ? { ...r, status: 'booked' } : r);
+          setStorageItem('roomsByPG', roomsByPG);
+        }
+      }
+      return { message: 'Booking updated offline' };
+    }
+    throw err;
+  }
+}
+
+/** Update Owner Password */
+export async function changeOwnerPassword({ oldPassword, newPassword }) {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/owner/change-password`, {
+      method: 'POST',
+      headers: getOwnerHeaders(),
+      body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
+    });
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.detail || 'Password change failed.');
+    }
+    return await response.json();
+  } catch (err) {
+    if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || localStorage.getItem('owner_token') === 'mock-jwt-owner-token') {
+      const pgName = localStorage.getItem('owner_pg_name');
+      const owners = JSON.parse(localStorage.getItem('pg_mock_owners'));
+      const idx = owners.findIndex(o => o.pg_name.toLowerCase() === pgName.toLowerCase());
+      if (idx === -1) throw new Error('Owner not found.');
+      
+      if (owners[idx].password !== oldPassword) {
+        throw new Error('Invalid old password.');
+      }
+      
+      owners[idx].password = newPassword;
+      localStorage.setItem('pg_mock_owners', JSON.stringify(owners));
+      return { message: 'Password changed offline successfully' };
+    }
+    throw err;
+  }
+}
+

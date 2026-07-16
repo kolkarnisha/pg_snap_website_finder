@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pyjwt
+bcrypt
+pydantic
+supabase
+python-dotenv
+email-validator

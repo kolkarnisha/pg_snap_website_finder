@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react';
 import { useBooking } from '../context/BookingContext';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
 export default function BookingForm({ pg }) {
   const { selectedRoom, addBooking, closeBookingForm } = useBooking();
   const [submitted, setSubmitted] = useState(false);
   const [bookingId, setBookingId] = useState('');
+  const [bookingRef, setBookingRef] = useState('');
   const [errors, setErrors] = useState({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   const [form, setForm] = useState({
     fullName: '',
@@ -44,6 +47,42 @@ export default function BookingForm({ pg }) {
     }
   }, [pg]);
 
+  const handleWhatsAppNotify = (overrideRef, existingWindow) => {
+    const formattedMobile = form.mobile.startsWith('91') ? form.mobile : `91${form.mobile}`;
+    const pgName = pg?.name || form.pgName;
+    const roomNum = selectedRoom?.roomNumber || form.roomNumber;
+    const roomType = form.roomType;
+    const rentVal = selectedRoom?.rent || pg?.rent || 0;
+    const checkIn = form.checkInDate;
+    const dur = form.duration;
+    const ref = overrideRef || bookingRef || bookingId;
+
+    const message = `Hello *${form.fullName}*! 👋
+
+Your booking request for *${pgName}* is confirmed! 🎉
+
+*Booking Details:*
+--------------------------------
+🏠 *PG:* ${pgName}
+🚪 *Room:* Room #${roomNum} (${roomType} Sharing)
+💰 *Monthly Rent:* ₹${rentVal.toLocaleString()}/mo
+📅 *Check-in Date:* ${checkIn}
+⏳ *Stay Duration:* ${dur} months
+📋 *Booking Reference:* ${ref}
+--------------------------------
+
+Thank you for choosing PGFinder! We are excited to welcome you home. 🏠`;
+
+    const encodedText = encodeURIComponent(message);
+    const whatsappUrl = `https://wa.me/${formattedMobile}?text=${encodedText}`;
+
+    if (existingWindow && !existingWindow.closed) {
+      existingWindow.location.href = whatsappUrl;
+    } else {
+      window.open(whatsappUrl, '_blank', 'noopener,noreferrer');
+    }
+  };
+
   const validate = () => {
     const errs = {};
     if (!form.fullName.trim()) errs.fullName = 'Full name is required';
@@ -51,8 +90,8 @@ export default function BookingForm({ pg }) {
     if (!form.mobile.trim()) errs.mobile = 'Mobile number is required';
     else if (!/^\d{10}$/.test(form.mobile.trim())) errs.mobile = 'Enter a valid 10-digit mobile number';
     if (!form.gender) errs.gender = 'Please select gender';
-    if (!form.aadhar.trim()) errs.aadhar = 'Aadhaar number is required';
-    else if (!/^\d{12}$/.test(form.aadhar.trim())) errs.aadhar = 'Enter a valid 12-digit Aadhaar number';
+    if (!form.photo) errs.photo = 'Aadhaar photo is required';
+    else if (!form.photo.type?.startsWith('image/')) errs.photo = 'Please upload a valid image file';
     if (!form.roomType) errs.roomType = 'Please select room type';
     if (!form.checkInDate) errs.checkInDate = 'Check-in date is required';
     else {
@@ -63,8 +102,6 @@ export default function BookingForm({ pg }) {
     }
     if (!form.duration) errs.duration = 'Duration of stay is required';
     if (!form.foodPreference) errs.foodPreference = 'Please select food preference';
-    // photo optional but if present must be image
-    if (form.photo && !form.photo.type?.startsWith('image/')) errs.photo = 'Please upload a valid image file';
     setErrors(errs);
     return Object.keys(errs).length === 0;
   };
@@ -74,36 +111,75 @@ export default function BookingForm({ pg }) {
     if (!validate()) return;
     if (isSubmitting) return;
     setIsSubmitting(true);
+    setSaveError('');
 
-    // Simulate brief processing
-    setTimeout(() => {
-      const bookingPayload = {
-        ...form,
-        pgId: pg?.id,
-        pgName: pg?.name,
-        roomNumber: selectedRoom?.roomNumber || parseInt(form.roomNumber) || null,
-        rent: selectedRoom?.rent || null,
-      };
-
-      // If photo file present, convert to data URL for storage
-      if (form.photo) {
-        const reader = new FileReader();
-        reader.onload = () => {
-          bookingPayload.photoData = reader.result;
-          const id = addBooking(bookingPayload);
-          setBookingId(id);
-          setSubmitted(true);
-          setIsSubmitting(false);
-        };
-        reader.readAsDataURL(form.photo);
-        return;
+    // Pre-open a blank window synchronously inside user click event to bypass popup blockers
+    let whatsappWindow = null;
+    try {
+      whatsappWindow = window.open('about:blank', '_blank');
+      if (whatsappWindow) {
+        whatsappWindow.document.write(`
+          <div style="font-family: 'Segoe UI', system-ui, sans-serif; text-align: center; margin-top: 80px; color: #333;">
+            <div style="font-size: 40px; margin-bottom: 12px; animation: pulse 1.5s infinite;">⏳</div>
+            <h3 style="margin: 0 0 8px;">Securing your booking...</h3>
+            <p style="color: #666; font-size: 14px; margin: 0;">Preparing your WhatsApp notification, please wait.</p>
+            <style>
+              @keyframes pulse {
+                0% { transform: scale(1); opacity: 0.8; }
+                50% { transform: scale(1.1); opacity: 1; }
+                100% { transform: scale(1); opacity: 0.8; }
+              }
+            </style>
+          </div>
+        `);
       }
+    } catch (err) {
+      console.warn('Browser blocked popup pre-open:', err);
+    }
 
-      const id = addBooking(bookingPayload);
-      setBookingId(id);
+    const processBooking = async (bookingPayload) => {
+      let ref = '';
+      try {
+        // addBooking handles saving to local state AND Supabase, returning the booking reference/ID
+        ref = await addBooking(bookingPayload);
+        const finalRef = ref || 'BK-' + Math.floor(Math.random() * 100000);
+        setBookingRef(finalRef);
+        setBookingId(finalRef);
+        
+        // Auto-send WhatsApp message immediately after booking is confirmed using the pre-opened window
+        handleWhatsAppNotify(finalRef, whatsappWindow);
+      } catch (err) {
+        setSaveError('⚠️ Saved locally but failed to sync: ' + err.message);
+        const finalRef = 'BK-' + Math.floor(Math.random() * 100000);
+        setBookingRef(finalRef);
+        setBookingId(finalRef);
+        
+        // Auto-send WhatsApp message fallback using the pre-opened window
+        handleWhatsAppNotify(finalRef, whatsappWindow);
+      }
       setSubmitted(true);
       setIsSubmitting(false);
-    }, 800);
+    };
+
+    const bookingPayload = {
+      ...form,
+      pgId: pg?.id,
+      pgName: pg?.name,
+      roomNumber: selectedRoom?.roomNumber || parseInt(form.roomNumber) || null,
+      rent: selectedRoom?.rent || null,
+    };
+
+    if (form.photo) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        bookingPayload.photoData = reader.result;
+        processBooking(bookingPayload);
+      };
+      reader.readAsDataURL(form.photo);
+      return;
+    }
+
+    processBooking(bookingPayload);
   };
 
   const handleChange = (field, value) => {
@@ -118,7 +194,6 @@ export default function BookingForm({ pg }) {
     if (errors.photo) setErrors(prev => { const n = { ...prev }; delete n.photo; return n; });
   };
 
-  // Get today's date as min for date input
   const today = new Date().toISOString().split('T')[0];
 
   if (submitted) {
@@ -130,13 +205,28 @@ export default function BookingForm({ pg }) {
             <h2>Booking Submitted!</h2>
             <p>Your booking request has been submitted successfully.</p>
             <div className="booking-id-display">
-              <span className="booking-id-label">Booking ID</span>
-              <span className="booking-id-value">{bookingId}</span>
+              <span className="booking-id-label">Booking Ref</span>
+              <span className="booking-id-value">{bookingRef || bookingId}</span>
             </div>
-            <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '16px' }}>
+            {isSupabaseConfigured && !saveError && (
+              <p style={{ fontSize: '13px', color: '#22c55e', marginTop: '10px', fontWeight: 500 }}>
+                ✅ Saved to database successfully
+              </p>
+            )}
+            {saveError && (
+              <p style={{ fontSize: '13px', color: '#f59e0b', marginTop: '10px' }}>{saveError}</p>
+            )}
+            <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '12px' }}>
               Our team will contact you shortly to confirm your booking.
             </p>
-            <button className="btn btn-primary" onClick={closeBookingForm} style={{ marginTop: '24px', width: '100%' }}>
+            <button 
+              className="whatsapp-btn" 
+              onClick={handleWhatsAppNotify} 
+              style={{ marginTop: '24px', width: '100%' }}
+            >
+              💬 Notify via WhatsApp
+            </button>
+            <button className="btn btn-primary" onClick={closeBookingForm} style={{ marginTop: '12px', width: '100%' }}>
               ✅ Done
             </button>
           </div>
@@ -153,8 +243,14 @@ export default function BookingForm({ pg }) {
           <button className="booking-form-close" onClick={closeBookingForm}>✕</button>
         </div>
 
+        {isSupabaseConfigured && (
+          <div style={{ fontSize: '12px', color: '#22c55e', textAlign: 'center', padding: '4px 0 8px', fontWeight: 500 }}>
+            🔒 Connected to Supabase — your booking will be saved securely
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="booking-form-body">
-          {/* Row 1: Name & Mobile */}
+          {/* Row 1: Name & Age */}
           <div className="booking-form-row">
             <div className="form-group">
               <label className="form-label" htmlFor="bf-name">Full Name *</label>
@@ -182,21 +278,29 @@ export default function BookingForm({ pg }) {
               {errors.mobile && <span className="field-error">{errors.mobile}</span>}
             </div>
             <div className="form-group">
-              <label className="form-label">Gender *</label>
-              <div className="booking-chips">
-                {['Male', 'Female', 'Other'].map(g => (
-                  <button key={g} type="button"
-                    className={`booking-chip ${form.gender === g ? 'active' : ''}`}
-                    onClick={() => handleChange('gender', g)}>
-                    {g === 'Male' ? '👨' : g === 'Female' ? '👩' : '👥'} {g}
-                  </button>
-                ))}
-              </div>
-              {errors.gender && <span className="field-error">{errors.gender}</span>}
+              <label className="form-label" htmlFor="bf-email">Email Address</label>
+              <input id="bf-email" className="form-input"
+                type="email" placeholder="you@example.com" value={form.email}
+                onChange={e => handleChange('email', e.target.value)} />
             </div>
           </div>
 
-          {/* Row 3: PG Name (auto-filled) & Room Number */}
+          {/* Row 3: Gender */}
+          <div className="form-group">
+            <label className="form-label">Gender *</label>
+            <div className="booking-chips">
+              {['Male', 'Female', 'Other'].map(g => (
+                <button key={g} type="button"
+                  className={`booking-chip ${form.gender === g ? 'active' : ''}`}
+                  onClick={() => handleChange('gender', g)}>
+                  {g === 'Male' ? '👨' : g === 'Female' ? '👩' : '👥'} {g}
+                </button>
+              ))}
+            </div>
+            {errors.gender && <span className="field-error">{errors.gender}</span>}
+          </div>
+
+          {/* Row 4: PG Name & Aadhaar Photo */}
           <div className="booking-form-row">
             <div className="form-group">
               <label className="form-label" htmlFor="bf-pg">Preferred PG</label>
@@ -204,24 +308,7 @@ export default function BookingForm({ pg }) {
                 style={{ background: 'rgba(249,115,22,0.06)', cursor: 'default' }} />
             </div>
             <div className="form-group">
-              <label className="form-label" htmlFor="bf-room">Selected Room</label>
-              <input id="bf-room" className="form-input" type="text"
-                value={form.roomNumber ? `Room ${form.roomNumber}` : 'Select from floor plan'}
-                readOnly style={{ background: 'rgba(249,115,22,0.06)', cursor: 'default' }} />
-            </div>
-          </div>
-
-          {/* Row: Aadhaar & Photo Upload */}
-          <div className="booking-form-row">
-            <div className="form-group">
-              <label className="form-label" htmlFor="bf-aadhar">Aadhaar Number *</label>
-              <input id="bf-aadhar" className={`form-input ${errors.aadhar ? 'input-error' : ''}`}
-                type="text" placeholder="123412341234" value={form.aadhar} maxLength={12}
-                onChange={e => handleChange('aadhar', e.target.value.replace(/\D/g, ''))} />
-              {errors.aadhar && <span className="field-error">{errors.aadhar}</span>}
-            </div>
-            <div className="form-group">
-              <label className="form-label">Upload Photo</label>
+              <label className="form-label">Aadhaar Photo *</label>
               <input type="file" accept="image/*" className={`form-input ${errors.photo ? 'input-error' : ''}`}
                 onChange={e => handlePhoto(e.target.files?.[0] || null)} />
               {errors.photo && <span className="field-error">{errors.photo}</span>}
@@ -233,7 +320,7 @@ export default function BookingForm({ pg }) {
             </div>
           </div>
 
-          {/* Row 4: Room Type */}
+          {/* Room Type */}
           <div className="form-group">
             <label className="form-label">Room Type *</label>
             <div className="booking-chips">
@@ -253,7 +340,7 @@ export default function BookingForm({ pg }) {
             {errors.roomType && <span className="field-error">{errors.roomType}</span>}
           </div>
 
-          {/* Row 5: Check-in & Duration */}
+          {/* Row 6: Check-in & Duration */}
           <div className="booking-form-row">
             <div className="form-group">
               <label className="form-label" htmlFor="bf-checkin">Check-in Date *</label>
@@ -277,7 +364,7 @@ export default function BookingForm({ pg }) {
             </div>
           </div>
 
-          {/* Row 6: Occupants & Food */}
+          {/* Row 7: Occupants & Food */}
           <div className="booking-form-row">
             <div className="form-group">
               <label className="form-label" htmlFor="bf-occupants">Number of Occupants</label>
@@ -322,7 +409,7 @@ export default function BookingForm({ pg }) {
               {isSubmitting ? (
                 <span style={{ display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'center' }}>
                   <span className="spinner" />
-                  Processing...
+                  Saving to Database...
                 </span>
               ) : '🚀 Book Now'}
             </button>
@@ -332,7 +419,3 @@ export default function BookingForm({ pg }) {
     </div>
   );
 }
-
-
-
-

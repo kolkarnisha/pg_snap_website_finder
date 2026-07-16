@@ -38,7 +38,25 @@ create or replace trigger on_auth_user_created
   for each row execute procedure public.handle_new_user();
 
 
--- 2. PG LISTINGS TABLE
+-- 2. USER LOGINS TABLE (stores login activity)
+create table if not exists user_logins (
+  id bigserial primary key,
+  user_id uuid references auth.users(id) on delete cascade,
+  name text,
+  email text not null,
+  role text default 'tenant',
+  provider text default 'email',        -- 'email', 'google', 'facebook'
+  login_at timestamptz default now(),
+  created_at timestamptz default now()
+);
+alter table user_logins enable row level security;
+create policy "Users can view their own login history" on user_logins for select using (auth.uid() = user_id);
+create policy "Users can insert their own login record" on user_logins for insert with check (auth.uid() = user_id);
+-- Allow service role / anon inserts for new signups
+create policy "Allow anon insert for login tracking" on user_logins for insert with check (true);
+
+
+-- 3. PG LISTINGS TABLE
 create table if not exists pg_listings (
   id bigserial primary key,
   name text not null,
@@ -61,7 +79,7 @@ create policy "Owners can update their own listings" on pg_listings for update u
 create policy "Owners can delete their own listings" on pg_listings for delete using (auth.uid() = owner_id);
 
 
--- 3. PG REVIEWS TABLE
+-- 4. PG REVIEWS TABLE
 create table if not exists pg_reviews (
   id bigserial primary key,
   pg_id bigint references pg_listings(id) on delete cascade,
@@ -79,27 +97,61 @@ create policy "Authenticated users can write reviews" on pg_reviews for insert w
 create policy "Users can update their own reviews" on pg_reviews for update using (auth.uid() = user_id);
 
 
--- 4. BOOKINGS TABLE
+-- 5. BOOKINGS TABLE (matches all fields from BookingForm)
 create table if not exists bookings (
   id bigserial primary key,
-  pg_id bigint references pg_listings(id) on delete cascade,
-  user_id uuid references profiles(id),
-  pg_name text,
-  user_name text,
-  user_email text,
-  user_phone text,
-  move_in_date date,
-  duration integer,
-  room_type text,
-  special_requests text,
-  status text default 'pending' check (status in ('pending', 'confirmed', 'cancelled')),
-  created_at timestamptz default now()
+
+  -- User identity
+  full_name    text not null,
+  age          integer check (age between 18 and 100),
+  mobile       text not null,
+  email        text,
+  gender       text check (gender in ('Male', 'Female', 'Other')),
+  aadhar       text,                        -- 12-digit Aadhaar number
+
+  -- PG & Room info
+  pg_id        bigint references pg_listings(id) on delete set null,
+  pg_name      text,
+  room_number  integer,
+  room_type    text check (room_type in ('single', 'double', 'triple', 'four')),
+  rent         integer,
+
+  -- Stay details
+  check_in_date  date,
+  duration       integer,                   -- months
+  occupants      integer default 1,
+  food_preference text check (food_preference in ('Veg', 'Non-Veg')),
+  notes          text,
+
+  -- Auth link (optional — filled if user is logged in)
+  user_id      uuid references auth.users(id) on delete set null,
+
+  -- Status
+  status       text default 'pending' check (status in ('pending', 'confirmed', 'cancelled')),
+  booking_ref  text unique,                 -- human-readable reference e.g. BK-2024-0001
+  created_at   timestamptz default now()
 );
 alter table bookings enable row level security;
+create policy "Anyone can insert a booking" on bookings for insert with check (true);
 create policy "Users can view their own bookings" on bookings for select using (auth.uid() = user_id);
-create policy "Authenticated users can create bookings" on bookings for insert with check (auth.uid() = user_id);
 create policy "Owners can view bookings for their PGs" on bookings for select
   using (exists (select 1 from pg_listings where id = pg_id and owner_id = auth.uid()));
+
+
+-- =============================================
+-- Auto-generate booking_ref on insert
+-- =============================================
+create or replace function generate_booking_ref()
+returns trigger as $$
+begin
+  new.booking_ref := 'BK-' || to_char(now(), 'YYYY') || '-' || lpad(new.id::text, 5, '0');
+  return new;
+end;
+$$ language plpgsql;
+
+create or replace trigger set_booking_ref
+  before insert on bookings
+  for each row execute function generate_booking_ref();
 
 
 -- =============================================
@@ -114,3 +166,47 @@ values
   ('Budget Stay PG', 'Marathahalli', 'Male', 4500, 3.8, '2.5 km', ARRAY['WiFi','Food','Hot Water'], 3, '{"1":2,"2":5,"3":3}', 'https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=600&q=80'),
   ('Luxury Living Suites', 'Marathahalli', 'Co-Live', 12500, 4.9, '0.4 km', ARRAY['WiFi','AC','Lift','Food','Gym','CCTV','Parking','Laundry'], 7, '{"1":0,"2":0,"3":0,"4":1,"5":0,"6":1,"7":1}', 'https://images.unsplash.com/photo-1507089947368-19c1da9775ae?w=600&q=80')
 on conflict do nothing;
+
+
+-- =============================================
+-- 6. OWNERS TABLE
+-- =============================================
+create table if not exists owners (
+  id bigserial primary key,
+  pg_name text unique not null,
+  password_hash text not null,
+  owner_name text not null,
+  email text unique not null,
+  phone_number text,
+  created_date timestamptz default now(),
+  last_login timestamptz
+);
+
+alter table owners enable row level security;
+create policy "Anyone can read owners" on owners for select using (true);
+create policy "Anyone can insert owners" on owners for insert with check (true);
+create policy "Owners can update their own profile" on owners for update using (true);
+
+
+-- =============================================
+-- 7. ROOMS TABLE
+-- =============================================
+create table if not exists rooms (
+  id bigserial primary key,
+  pg_id bigint references pg_listings(id) on delete cascade,
+  room_number integer not null,
+  floor integer not null,
+  sharing text not null check (sharing in ('single', 'double', 'triple', 'four')),
+  rent integer not null,
+  status text not null check (status in ('available', 'booked', 'maintenance')),
+  has_attached_bathroom boolean default true,
+  is_ac boolean default false,
+  has_balcony boolean default false,
+  unique(pg_id, room_number)
+);
+
+alter table rooms enable row level security;
+create policy "Anyone can read rooms" on rooms for select using (true);
+create policy "Anyone can modify rooms" on rooms for all using (true);
+
+

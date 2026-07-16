@@ -24,27 +24,7 @@ export default function Hero({ onExplore, searchComponent }) {
 
         {searchComponent}
 
-        <div className="hero-stats">
-          <div className="hero-stat">
-            <div className="hero-stat-num">500+</div>
-            <div className="hero-stat-label">Verified PGs</div>
-          </div>
-          <div className="hero-divider" />
-          <div className="hero-stat">
-            <div className="hero-stat-num">12K+</div>
-            <div className="hero-stat-label">Happy Tenants</div>
-          </div>
-          <div className="hero-divider" />
-          <div className="hero-stat">
-            <div className="hero-stat-num">4.8⭐</div>
-            <div className="hero-stat-label">Avg Rating</div>
-          </div>
-          <div className="hero-divider" />
-          <div className="hero-stat">
-            <div className="hero-stat-num">₹0</div>
-            <div className="hero-stat-label">Brokerage</div>
-          </div>
-        </div>
+
       </div>
     </section>
   );
