@@ -6,3 +6,17 @@ details should include
           owner name,
           contact of pg,
                 rent,deposit,facilities,food
+
+
+
+
+(07-09-2026)
+i want to create table using sql
+i want to create hostelstays in india first table
+inside that table i want to add cities,places and area, state etc 
+and inside states i want to add  the popular cities and if i select that city i want to get hostelstays 
+for example:
+if i select * from india; -- i should get states-- and again if i select * from karnataka -- 
+i shall get cities banagalore,... and again if i select * from bangalore i shall get marathalli,yelhanka like that 
+finally if i select * from marathalli i shall get hostelstays
+with columns pg_id. pg_name,adress/area,pincode,category,city,state,owner_name,contact....etc
