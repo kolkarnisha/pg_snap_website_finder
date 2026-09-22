@@ -32,12 +32,9 @@ begin
   return new;
 end;
 $$ language plpgsql security definer;
-
 create or replace trigger on_auth_user_created
   after insert on auth.users
   for each row execute procedure public.handle_new_user();
-
-
 -- 2. USER LOGINS TABLE (stores login activity)
 create table if not exists user_logins (
   id bigserial primary key,
@@ -77,8 +74,6 @@ create policy "Anyone can view PG listings" on pg_listings for select using (tru
 create policy "Owners can insert their own listings" on pg_listings for insert with check (auth.uid() = owner_id);
 create policy "Owners can update their own listings" on pg_listings for update using (auth.uid() = owner_id);
 create policy "Owners can delete their own listings" on pg_listings for delete using (auth.uid() = owner_id);
-
-
 -- 4. PG REVIEWS TABLE
 create table if not exists pg_reviews (
   id bigserial primary key,
@@ -100,7 +95,6 @@ create policy "Users can update their own reviews" on pg_reviews for update usin
 -- 5. BOOKINGS TABLE (matches all fields from BookingForm)
 create table if not exists bookings (
   id bigserial primary key,
-
   -- User identity
   full_name    text not null,
   age          integer check (age between 18 and 100),
@@ -108,14 +102,12 @@ create table if not exists bookings (
   email        text,
   gender       text check (gender in ('Male', 'Female', 'Other')),
   aadhar       text,                        -- 12-digit Aadhaar number
-
   -- PG & Room info
   pg_id        bigint references pg_listings(id) on delete set null,
   pg_name      text,
   room_number  integer,
   room_type    text check (room_type in ('single', 'double', 'triple', 'four')),
   rent         integer,
-
   -- Stay details
   check_in_date  date,
   duration       integer,                   -- months
@@ -166,8 +158,6 @@ values
   ('Budget Stay PG', 'Marathahalli', 'Male', 4500, 3.8, '2.5 km', ARRAY['WiFi','Food','Hot Water'], 3, '{"1":2,"2":5,"3":3}', 'https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=600&q=80'),
   ('Luxury Living Suites', 'Marathahalli', 'Co-Live', 12500, 4.9, '0.4 km', ARRAY['WiFi','AC','Lift','Food','Gym','CCTV','Parking','Laundry'], 7, '{"1":0,"2":0,"3":0,"4":1,"5":0,"6":1,"7":1}', 'https://images.unsplash.com/photo-1507089947368-19c1da9775ae?w=600&q=80')
 on conflict do nothing;
-
-
 -- =============================================
 -- 6. OWNERS TABLE
 -- =============================================
@@ -181,7 +171,6 @@ create table if not exists owners (
   created_date timestamptz default now(),
   last_login timestamptz
 );
-
 alter table owners enable row level security;
 create policy "Anyone can read owners" on owners for select using (true);
 create policy "Anyone can insert owners" on owners for insert with check (true);
@@ -204,9 +193,13 @@ create table if not exists rooms (
   has_balcony boolean default false,
   unique(pg_id, room_number)
 );
-
 alter table rooms enable row level security;
 create policy "Anyone can read rooms" on rooms for select using (true);
 create policy "Anyone can modify rooms" on rooms for all using (true);
+
+
+
+
+
 
 
