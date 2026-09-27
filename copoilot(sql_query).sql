@@ -1,7 +1,6 @@
 /* you want a hierarchical SQL design where queries like SELECT * FROM India; 
 give you states, then drilling down into a state gives cities, then into a city gives areas/places, and 
 finally into an area gives hostel stays with full details.
-
 This requires a normalized relational schema with proper foreign keys. Let’s build it:m */
 -- 1. Country Table
 CREATE TABLE Country (
