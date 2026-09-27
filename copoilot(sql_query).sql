@@ -8,6 +8,7 @@ CREATE TABLE Country (
     country_name VARCHAR(100) NOT NULL
 );
 
+
 -- 2. States Table
 CREATE TABLE States (
     state_id INT PRIMARY KEY AUTO_INCREMENT,
