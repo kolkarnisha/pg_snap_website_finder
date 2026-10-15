@@ -20,3 +20,5 @@ if i select * from india; -- i should get states-- and again if i select * from 
 i shall get cities banagalore,... and again if i select * from bangalore i shall get marathalli,yelhanka like that 
 finally if i select * from marathalli i shall get hostelstays
 with columns pg_id. pg_name,adress/area,pincode,category,city,state,owner_name,contact....etc
+
+
